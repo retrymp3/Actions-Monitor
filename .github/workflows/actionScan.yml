@@ -1,0 +1,287 @@
+name: Action Scanner
+
+on:
+  workflow_call:
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: true
+      JIRA_BASE_URL:
+        required: true
+      JIRA_API_USER:
+        required: true
+      JIRA_API_TOKEN:
+        required: true
+      JIRA_PROJECT_KEY:
+        required: true
+        
+jobs:
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep Security Scan
+        id: semgrep
+        run: |
+          echo "🔍 Installing Semgrep..."
+          pip install semgrep
+          
+          echo "🔍 Running security scan..."
+          semgrep --config=p/github-actions --json > semgrep-results.json
+          
+          echo "📊 Scan completed. Results saved to semgrep-results.json"
+
+      - name: Analyze Scan Results
+        id: analyze
+        run: |
+          echo "📋 Analyzing scan results..."
+          
+          # Count issues by severity
+          critical_count=$(jq '.results[] | select(.extra.severity == "ERROR") | 1' semgrep-results.json | wc -l)
+          high_count=$(jq '.results[] | select(.extra.severity == "WARNING") | 1' semgrep-results.json | wc -l)
+          medium_count=$(jq '.results[] | select(.extra.severity == "INFO") | 1' semgrep-results.json | wc -l)
+          low_count=$(jq '.results[] | select(.extra.severity == "DEBUG") | 1' semgrep-results.json | wc -l)
+          total_count=$(jq '.results | length' semgrep-results.json)
+          
+          # Set outputs
+          echo "critical_count=$critical_count" >> $GITHUB_OUTPUT
+          echo "high_count=$high_count" >> $GITHUB_OUTPUT
+          echo "medium_count=$medium_count" >> $GITHUB_OUTPUT
+          echo "low_count=$low_count" >> $GITHUB_OUTPUT
+          echo "total_count=$total_count" >> $GITHUB_OUTPUT
+          
+          # Extract CWE information for notifications
+          if [ $total_count -gt 0 ]; then
+            first_cwe=$(jq -r '.results[0].extra.metadata.cwe[0] // "Security Issue Detected"' semgrep-results.json)
+            echo "first_cwe=$first_cwe" >> $GITHUB_OUTPUT
+            
+            # Get all CWE titles
+            jq -r '.results[] | .extra.metadata.cwe[0] // "Unknown CWE"' semgrep-results.json > cwe_titles.txt
+            echo "cwe_titles<<EOF" >> $GITHUB_OUTPUT
+            cat cwe_titles.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "first_cwe=No Security Issues Found" >> $GITHUB_OUTPUT
+            echo "cwe_titles=No issues found" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check for critical issues
+          if [ $critical_count -gt 0 ]; then
+            echo "❌ Critical security issues found! Pipeline will be terminated."
+            echo "critical_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "critical_found=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "✅ Analysis completed"
+
+      - name: Generate Reports and Summary
+        if: always()
+        run: |
+          echo "📝 Generating reports..."
+          
+          # Create detailed summary report
+          echo "## Semgrep Security Scan Summary Report" > summary-report.md
+          echo "" >> summary-report.md
+          echo "### Severity Breakdown:" >> summary-report.md
+          echo "- **Critical (ERROR):** ${{ steps.analyze.outputs.critical_count }}" >> summary-report.md
+          echo "- **High (WARNING):** ${{ steps.analyze.outputs.high_count }}" >> summary-report.md
+          echo "- **Medium (INFO):** ${{ steps.analyze.outputs.medium_count }}" >> summary-report.md
+          echo "- **Low (DEBUG):** ${{ steps.analyze.outputs.low_count }}" >> summary-report.md
+          echo "- **Total Issues:** ${{ steps.analyze.outputs.total_count }}" >> summary-report.md
+          echo "" >> summary-report.md
+          
+          if [ "${{ steps.analyze.outputs.total_count }}" -gt 0 ]; then
+            echo "### Detailed Findings:" >> summary-report.md
+            echo "" >> summary-report.md
+            
+            # Process each result and add to report
+            jq -r '.results[] | "#### \(.check_id) - \(.extra.message)\n- **Severity:** \(.extra.severity)\n- **File:** \(.path):\(.start.line)\n- **CWE:** \(.extra.metadata.cwe // "N/A")\n- **Likelihood:** \(.extra.metadata.likelihood // "N/A")\n- **Impact:** \(.extra.metadata.impact // "N/A")\n"' semgrep-results.json >> summary-report.md
+          else
+            echo "### Status: ✅ No security issues found" >> summary-report.md
+          fi
+          
+          # Store summary report as output
+          echo "summary_report<<EOF" >> $GITHUB_OUTPUT
+          cat summary-report.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Create job summary for GitHub Actions UI
+          echo "## 🔍 Semgrep Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.analyze.outputs.total_count }}" == "0" ]; then
+            echo "### ✅ No Security Issues Found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Great job! No security vulnerabilities were detected in this scan." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 📊 Scan Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **Total Issues:** ${{ steps.analyze.outputs.total_count }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Critical:** ${{ steps.analyze.outputs.critical_count }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **High:** ${{ steps.analyze.outputs.high_count }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Medium:** ${{ steps.analyze.outputs.medium_count }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Low:** ${{ steps.analyze.outputs.low_count }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            echo "### 🚨 Detailed Findings" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Process each result and add to report
+            jq -r '.results[] | "#### " + .extra.metadata.cwe[0] + "\n\n**Summary:** " + .extra.message + "\n\n**Details:**\n- **File:** `" + .path + ":" + (.start.line | tostring) + "`\n- **Severity:** " + .extra.severity + "\n- **Rule:** " + .check_id + "\n- **CWE:** " + (.extra.metadata.cwe | join(", ")) + "\n\n---\n"' semgrep-results.json >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ steps.analyze.outputs.critical_found }}" == "true" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### ⚠️ Pipeline Terminated" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Critical security issues were detected. The pipeline has been terminated to prevent deployment of vulnerable code." >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          echo "✅ Reports and summary generated"
+
+      - name: Send Slack Notifications
+        if: steps.analyze.outputs.total_count > 0
+        run: |
+          echo "📢 Sending Slack notifications..."
+          
+          # Function to create Slack payload
+          create_slack_payload() {
+            local cwe="$1"
+            local message="$2"
+            local severity="$3"
+            local file="$4"
+            local line="$5"
+            local rule="$6"
+            
+            # Determine severity emoji and text
+            local severity_emoji=""
+            local severity_text=""
+            if [ "$severity" = "ERROR" ]; then
+              severity_emoji="🔴"
+              severity_text="Critical"
+            elif [ "$severity" = "WARNING" ]; then
+              severity_emoji="🟡"
+              severity_text="High"
+            elif [ "$severity" = "INFO" ]; then
+              severity_emoji="🟠"
+              severity_text="Medium"
+            elif [ "$severity" = "DEBUG" ]; then
+              severity_emoji="🔵"
+              severity_text="Low"
+            fi
+            
+            jq -n \
+              --arg repo "${{ github.repository }}" \
+              --arg event "${{ github.event_name }}" \
+              --arg pr "${{ github.event.pull_request.number || 'N/A' }}" \
+              --arg pr_url "${{ github.event.pull_request.html_url || '' }}" \
+              --arg cwe "$cwe" \
+              --arg message "$message" \
+              --arg severity_emoji "$severity_emoji" \
+              --arg severity_text "$severity_text" \
+              --arg file "$file" \
+              --arg line "$line" \
+              --arg user "${{ github.event_name == 'pull_request' && github.event.pull_request.user.login || github.actor }}" \
+              --arg run_id "${{ github.run_id }}" \
+              '{
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": $cwe,
+                      "emoji": true
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ("*Repository:* <https://github.com/" + $repo + "|" + $repo + ">\n*Event:* `" + $event + "`\n*PR:* " + (if $pr != "N/A" then "<" + $pr_url + "|#" + $pr + ">" else "#N/A" end))
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ("*Severity:* " + $severity_emoji + " " + $severity_text)
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ("*File:* `" + $file + ":" + $line + "`")
+                    }
+                  },
+                  {
+                    "type": "divider"
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": ("📄 <https://github.com/" + $repo + "/actions/runs/" + $run_id + "|View Run Details>")
+                    }
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {
+                        "type": "mrkdwn",
+                        "text": ("*Raised_by:* `" + $user + "`")
+                      }
+                    ]
+                  }
+                ]
+              }' > "slack-payload-$(date +%s%N).json"
+          }
+          
+          # Process all issues and send to Slack
+          jq -r '.results[] | .extra.metadata.cwe[0] + "|" + .extra.message + "|" + .extra.severity + "|" + .path + "|" + (.start.line | tostring) + "|" + .check_id' semgrep-results.json > all-issues.txt
+          
+          while IFS='|' read -r cwe message severity file line rule; do
+            create_slack_payload "$cwe" "$message" "$severity" "$file" "$line" "$rule"
+          done < all-issues.txt
+          
+          # Send all Slack messages
+          for payload_file in slack-payload-*.json; do
+            if [ -f "$payload_file" ]; then
+              echo "📤 Sending Slack notification for $payload_file"
+              curl -X POST -H 'Content-type: application/json' \
+                --data @$payload_file \
+                ${{ secrets.SLACK_WEBHOOK_URL }}
+              rm "$payload_file"
+            fi
+          done
+          
+          echo "✅ Slack notifications sent"
+
+      - name: Setup Python and Create Jira Issues
+        if: steps.analyze.outputs.total_count > 0
+        run: |
+          echo "🐍 Setting up Python environment..."
+          python3 --version
+          
+          echo "📦 Installing dependencies..."
+          pip install requests urllib3
+          
+          echo "🔍 Creating Jira issues for security vulnerabilities..."
+          
+          # Run Python script to create Jira tickets
+          python3 create_jira_tickets.py --results semgrep-results.json
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_API_USER: ${{ secrets.JIRA_API_USER }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+
+      - name: Fail Pipeline for Critical Issues
+        if: steps.analyze.outputs.critical_found == 'true'
+        run: |
+          echo "❌ Critical security issues detected. Terminating pipeline."
+          exit 1
