@@ -1,0 +1,22 @@
+name: GitHub Actions Security Scanner
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - master
+      - release/*
+    paths:
+      - ".github/workflows/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+      - master
+      - release/*
+    paths:
+      - ".github/workflows/**"
+jobs:
+  security-scan:
+    uses: achuthvp/GitActions-monitor/.github/workflows/action-scanner.yml@main
+    secrets: inherit
